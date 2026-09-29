@@ -2,7 +2,7 @@ use super::super::{
     build_deployment_command_list_for_output_dir, build_pocketbase_migrations_pull_command,
 };
 use super::fixture::{DeployFixture, RecordingRunner};
-use crate::cli::process::ProcessCommand;
+use crate::vaieart_services::process::ProcessCommand;
 use std::fs;
 
 #[test]

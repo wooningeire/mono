@@ -1,5 +1,5 @@
-use crate::cli::config::{Config, ServiceMap};
-use crate::cli::process::{CommandRunner, ProcessCommand};
+use crate::vaieart_services::config::{Config, ServiceMap};
+use crate::vaieart_services::process::{CommandRunner, ProcessCommand};
 use anyhow::Result;
 use std::{cell::RefCell, fs, path::PathBuf};
 use tempfile::TempDir;

@@ -1,6 +1,6 @@
 use super::super::build_deployment_command_list_for_output_dir;
 use super::fixture::DeployFixture;
-use crate::cli::process::ProcessCommand;
+use crate::vaieart_services::process::ProcessCommand;
 
 #[test]
 fn deploy_plan_builds_before_service_rsync() {

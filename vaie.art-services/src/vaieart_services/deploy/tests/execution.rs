@@ -1,6 +1,6 @@
 use super::super::{build_deployment_command_list_for_output_dir, deploy};
 use super::fixture::{DeployFixture, RecordingRunner};
-use crate::cli::process::CommandRunner;
+use crate::vaieart_services::process::CommandRunner;
 
 #[test]
 fn remote_install_restarts_deno_services_after_sync() {

@@ -1,5 +1,5 @@
-pub mod cli;
+pub mod vaieart_services;
 
 fn main() -> anyhow::Result<()> {
-    cli::run()
+    vaieart_services::run()
 }
