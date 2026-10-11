@@ -1,0 +1,15 @@
+[submodule "src/submodules/vaie.art"]
+	path = src/submodules/vaie.art
+	url = https://github.com/wooningeire/vaie.art.git
+[submodule "src/submodules/pudle"]
+	path = src/submodules/pudle
+	url = https://github.com/wooningeire/pudle.git
+[submodule "src/submodules/plover-hatchery"]
+	path = src/submodules/plover-hatchery
+	url = https://github.com/wooningeire/plover-hatchery.git
+[submodule "src/submodules/pb.vaie.art"]
+	path = src/submodules/pb.vaie.art
+	url = https://github.com/wooningeire/pb.vaie.art.git
+[submodule "src/submodules/dragonscaler"]
+	path = src/submodules/dragonscaler
+	url = https://github.com/wooningeire/dragonscaler

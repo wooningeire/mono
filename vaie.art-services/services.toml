@@ -1,0 +1,108 @@
+manifest_version = 1
+
+[remote]
+port = 22
+ssh_program = "ssh"
+rsync_program = "rsync"
+tmp_dir = "/tmp/vaieart-services"
+caddyfile_path = "/etc/caddy/Caddyfile"
+systemd_dir = "/etc/systemd/system"
+
+# indicates that a service is managed by this project
+managed_prefix = "vaieart-"
+
+# where's the deno executable?
+deno_bin = "/root/.deno/bin/deno"
+
+# Put private SSH connection details in ignored `services.local.toml`.
+# This file intentionally keeps host/user/IP/key paths out of tracked config.
+
+[caddy]
+primary_host = "vaie.art"
+www_redirect_host = "www.vaie.art"
+
+
+[pocketbase]
+name = "pb"
+host = "pb.vaie.art"
+source_path = "src/submodules/pb.vaie.art"
+remote_path = "/srv/vaieart-pocketbase"
+data_dir = "/var/lib/vaieart-pocketbase/pb_data"
+backup_dir = "/var/backups/vaieart-pocketbase"
+port = 8090
+binary = "/opt/pocketbase/pocketbase"
+request_body_max_size = "25MB"
+read_timeout = "360s"
+
+[pocketbase.warp_proxy]
+port = 40000
+
+
+[[services]]
+name = "vaie.art"
+kind = "deno_app"
+local_path = "src/submodules/vaie.art"
+remote_path = "/srv/vaie.art"
+port = 3000
+sync_source = "build"
+entrypoint = "index.js"
+route_path = "/"
+
+[services.build]
+commands = [
+    ["deno", "install", "--frozen-lockfile"],
+    ["deno", "task", "convert-media"],
+    ["deno", "task", "build"],
+]
+
+
+[[services]]
+name = "pudle"
+kind = "static_site"
+local_path = "src/submodules/pudle"
+remote_path = "/web/pudle"
+sync_source = "build"
+route_path = "/pudle"
+
+[services.build]
+commands = [
+    ["deno", "install", "--frozen-lockfile"],
+    ["deno", "task", "build"],
+]
+
+
+[[services]]
+name = "hatchery-web"
+kind = "deno_app"
+local_path = "src/submodules/plover-hatchery/web"
+remote_path = "/srv/hatchery"
+port = 3001
+sync_source = "build"
+entrypoint = "index.js"
+route_path = "/hatchery"
+
+[services.build]
+commands = [
+    ["deno", "install", "--frozen-lockfile"],
+    ["deno", "task", "build"],
+]
+
+[[services]]
+name = "dragonscaler"
+kind = "deno_app"
+local_path = "src/submodules/dragonscaler"
+remote_path = "/srv/dragonscaler"
+port = 3002
+sync_source = "build"
+entrypoint = "index.js"
+route_path = "/dragonscaler"
+
+[services.environment]
+PUBLIC__POCKETBASE_URL = "https://pb.vaie.art"
+
+[services.build]
+environment = { PUBLIC__POCKETBASE_URL = "https://pb.vaie.art" }
+commands = [
+    ["deno", "install", "--frozen-lockfile"],
+    ["deno", "task", "build"],
+]
