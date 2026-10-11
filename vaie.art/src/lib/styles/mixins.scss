@@ -1,0 +1,53 @@
+@use "./fonts.scss";
+
+@mixin glass {
+    backdrop-filter: blur(0.25rem);
+
+}
+
+@mixin glass-button-exterior {
+    @include glass;
+
+    border: 2px solid oklch(0.9 0.01 200 / 0.1);
+
+    box-shadow: 0 0.125rem 1rem oklch(0 0 0 / 0.5);
+
+    cursor: pointer;
+
+    &:hover,
+    &:focus-within {
+        border-color: oklch(0.9 0.01 200 / 0.5);
+    }
+
+    &:active {
+        border-color: oklch(0.9 0.01 200 / 0.1);
+    }
+}
+
+
+@mixin glass-button {
+    @include glass-button-exterior;
+    
+    background-color: oklch(0.9 0.01 200 / 0.05);
+    font-family: fonts.$font-title;
+}
+
+@mixin glass-button-small {
+    @include glass-button;
+
+    padding: 0.125em 0.5em;
+    
+    border-radius: 0.125em;
+}
+
+
+@mixin glass-input {
+    @include glass;
+    
+    border: 2px solid oklch(0.9 0.01 200 / 0.25);
+    box-shadow:
+        0 0.125rem 1rem oklch(0 0 0 / 0.5),
+        0 0.125rem 1rem oklch(0 0 0 / 0.5) inset;
+
+    background-color: oklch(0.9 0.01 200 / 0.05);
+}
