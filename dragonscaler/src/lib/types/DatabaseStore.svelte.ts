@@ -1,0 +1,1090 @@
+import PocketBase, {
+    ClientResponseError,
+    type AuthRecord,
+    type RecordAuthResponse,
+} from "pocketbase";
+import { Character } from "./Character.svelte";
+import {
+    Collections,
+    LEGACY_BASELINES_COLLECTION,
+    type AccountRecord,
+    type CharacterFormRecord,
+    type CharacterRecord,
+    type IdentityRecord,
+    type LegacyBaselineRecord,
+    type PocketbaseCommonRecord,
+    type ReferenceImageRecord,
+} from "./PocketBaseTypes";
+import {
+    CharacterImage,
+    type Dimensions,
+} from "./CharacterImage.svelte";
+import { Baseline } from "./Baseline.svelte";
+import {
+    CHARACTER_IMAGE_THUMB_SIZE,
+    getPocketbaseFileUrl,
+    pocketbaseUrl,
+} from "$lib/util/pocketbase";
+import type { IdentitySummary } from "./Identity";
+import { normalizeShoulderY } from "$lib/util/shoulderAltitude";
+
+
+type PocketBaseWritePayload = Record<string, unknown>;
+
+
+const RECORD_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
+const RECORD_ID_LENGTH = 15;
+const DISCORD_LOGIN_EXCHANGE_TIMEOUT_MS = 15_000;
+const DISCORD_LOGIN_TIMEOUT_MESSAGE = "The sign-in server did not respond. Try again in a moment.";
+const POCKETBASE_WRITE_OPTIONS = {
+    // A collection path alone is not a write idempotency key.
+    requestKey: null,
+};
+
+
+class DiscordLoginTimeoutError extends Error {
+    constructor() {
+        super(DISCORD_LOGIN_TIMEOUT_MESSAGE);
+        this.name = "DiscordLoginTimeoutError";
+    }
+}
+
+
+export class DatabaseStore {
+    private readonly pb: PocketBase;
+    private readonly characterWrites = new WeakMap<Character, Promise<unknown>>();
+    private readonly defaultIdentityWrites = new Map<string, Promise<IdentitySummary>>();
+    private discordLoginPromise: Promise<RecordAuthResponse> | null = null;
+    userRecord = $state<AuthRecord>(null);
+    discordLoginError = $state<string | null>(null);
+    discordLoginPending = $state(false);
+
+
+    constructor() {
+        this.pb = new PocketBase(pocketbaseUrl);
+        this.syncClientAuthCookie();
+    }
+
+    loadUserRecord() {
+        this.loadClientAuthCookieFallback();
+
+        if (!this.pb.authStore.isValid) {
+            this.pb.authStore.clear();
+        }
+
+        this.userRecord = this.pb.authStore.record;
+    }
+
+    canEditCharacter(character: Character) {
+        const accountId = this.userRecord?.id ?? null;
+
+        return accountId !== null && character.ownerIdentities.some(
+            identity => identity.accountId === accountId,
+        );
+    }
+
+    async loadCharacterData() {
+        const characterDataResultPromise = this.pb.collection(Collections.Characters).getFullList<CharacterRecord>();
+        const legacyBaselinesResultPromise = this.loadOptionalRecords<LegacyBaselineRecord>(LEGACY_BASELINES_COLLECTION);
+        const characterFormsResultPromise = this.loadOptionalRecords<CharacterFormRecord>(Collections.CharacterForms);
+        const referenceImagesResultPromise = this.loadOptionalRecords<ReferenceImageRecord>(Collections.ReferenceImages);
+        const identitiesResultPromise = this.loadOptionalRecords<IdentityRecord>(Collections.Identities);
+
+        const [
+            characterDataResult,
+            legacyBaselinesResult,
+            characterFormsResult,
+            referenceImagesResult,
+            identitiesResult,
+        ] = await Promise.all([
+            characterDataResultPromise,
+            legacyBaselinesResultPromise,
+            characterFormsResultPromise,
+            referenceImagesResultPromise,
+            identitiesResultPromise,
+        ]);
+
+        const accountsById = await this.loadAccountsById(this.collectAccountIds(
+            characterDataResult,
+            identitiesResult,
+        ));
+        const identitiesById = new Map(identitiesResult.map(identity => [identity.id, identity]));
+        const referenceImagesById = new Map(referenceImagesResult.map(referenceImage => [referenceImage.id, referenceImage]));
+        const formsByCharacterId = this.groupByCharacterId(characterFormsResult);
+        const characters: Character[] = [];
+
+        for (const characterData of characterDataResult) {
+            const form = this.selectDefaultForm(formsByCharacterId.get(characterData.id) ?? []);
+            const legacyBaseline = this.selectLegacyBaseline(
+                legacyBaselinesResult,
+                characterData.id,
+                form?.id ?? null,
+            );
+            const referenceImage = this.selectReferenceImage(
+                form,
+                referenceImagesById,
+            );
+            const ownerIdentities = this.resolveCharacterIdentities(
+                characterData.owner_identity_ids ?? [],
+                identitiesById,
+                accountsById,
+            );
+            const legacyOwner = this.isRecordId(characterData.owner_id)
+                ? accountsById.get(characterData.owner_id) ?? null
+                : null;
+            const sonaIdentities = this.resolveCharacterIdentities(
+                characterData.sona_identity_ids ?? [],
+                identitiesById,
+                accountsById,
+            );
+
+            if (ownerIdentities.length === 0 && legacyOwner !== null) {
+                ownerIdentities.push(this.legacyIdentitySummary(legacyOwner));
+            }
+
+            const anchor = (
+                referenceImage?.anchor_point
+                ?? form?.center_point
+                ?? characterData.center_point
+                ?? {x: 0.5, y: 0}
+            );
+            const storedMeasurements = referenceImage?.measurements ?? [];
+            const hasStoredMeasurements = storedMeasurements.length > 0;
+            const measurements = hasStoredMeasurements
+                ? storedMeasurements.map(measurement => new Baseline({
+                    id: measurement.id,
+                    points: measurement.points,
+                    targetLength: form?.length_meters ?? legacyBaseline?.length_meters,
+                    measurementUnit: form?.length_unit,
+                    descriptor: measurement.descriptor,
+                    referenceSizingMethod: measurement.reference_sizing_method,
+                    pixelMeasurementPx: measurement.pixel_measurement_px ?? null,
+                }))
+                : [new Baseline({
+                    points: referenceImage?.baseline_points ?? legacyBaseline?.points,
+                    descriptor: referenceImage?.baseline_descriptor ?? legacyBaseline?.descriptor,
+                    targetLength: form?.length_meters ?? legacyBaseline?.length_meters,
+                    measurementUnit: form?.length_unit,
+                    referenceSizingMethod: referenceImage?.reference_sizing_method,
+                    pixelMeasurementPx: referenceImage?.pixel_measurement_px ?? null,
+                })];
+            const shoulderY = hasStoredMeasurements
+                ? null
+                : normalizeShoulderY({
+                    shoulderY: referenceImage?.shoulder_y,
+                    groundY: anchor.y,
+                });
+            const character = new Character({
+                id: characterData.id,
+                image: null,
+                imageDimensions: this.referenceImageDimensions(referenceImage),
+                name: characterData.name,
+                anchor,
+                shoulderY,
+                measurements,
+                referenceMeasurementId: hasStoredMeasurements
+                    ? referenceImage?.reference_measurement_id
+                    : measurements[0].id,
+                shoulderMeasurementId: hasStoredMeasurements
+                    ? referenceImage?.shoulder_measurement_id
+                    : null,
+                formId: form?.id ?? null,
+                referenceImageIds: form?.reference_image_ids ?? [],
+                ownerIdentities,
+                sonaIdentities,
+                uploaded: true,
+            });
+
+            const imageSource = referenceImage === null
+                ? this.getLegacyImageSource(characterData)
+                : {
+                    collection: Collections.ReferenceImages,
+                    recordId: referenceImage.id,
+                    filename: referenceImage.image,
+                };
+
+            if (imageSource !== null) {
+                const characterImageUrl = getPocketbaseFileUrl({
+                    ...imageSource,
+                    thumb: CHARACTER_IMAGE_THUMB_SIZE,
+                });
+
+                void CharacterImage.fromUrl(
+                    characterImageUrl,
+                    imageSource.filename,
+                    {
+                        flippedHorizontally: referenceImage?.flipped_horizontally ?? false,
+                        dimensions: character.imageDimensions,
+                    },
+                )
+                    .then(image => {
+                        character.image = image;
+                        character.imageDimensions = image.dimensions;
+                    })
+                    .catch(error => console.error(error));
+            }
+
+            characters.push(character);
+        }
+
+        return characters;
+    }
+
+    async createCharacter(character: Character) {
+        return await this.runExclusiveCharacterWrite(character, async () => {
+            const ownerIdentityIds = await this.resolveOwnerIdentityIds(character);
+            const characterId = this.ensureRecordId(character.id);
+            character.id = characterId;
+            const characterData = this.characterWriteData(
+                character,
+                ownerIdentityIds,
+            );
+            const charRecord = await this.createOrUpdateRecord<CharacterRecord>(
+                Collections.Characters,
+                characterId,
+                characterData,
+            );
+
+            const referenceImageId = await this.saveReferenceImage(character);
+            const formId = this.ensureRecordId(character.formId);
+            character.formId = formId;
+            await this.createOrUpdateRecord<CharacterFormRecord>(
+                Collections.CharacterForms,
+                formId,
+                this.defaultFormWriteData(
+                    charRecord.id,
+                    character,
+                    referenceImageId,
+                ),
+            );
+
+            character.referenceImageIds = [referenceImageId];
+            character.uploaded = true;
+
+            return charRecord;
+        });
+    }
+
+    async updateCharacter(character: Character) {
+        return await this.runExclusiveCharacterWrite(character, async () => {
+            if (!this.isRecordId(character.id)) throw new Error("character has no id");
+            if (!this.canEditCharacter(character)) {
+                throw new Error("current account does not own this character");
+            }
+
+            const ownerIdentityIds = await this.resolveOwnerIdentityIds(character);
+            await this.pb.collection(Collections.Characters).update(
+                character.id,
+                this.characterWriteData(
+                    character,
+                    ownerIdentityIds,
+                ),
+                POCKETBASE_WRITE_OPTIONS,
+            );
+
+            const referenceImageId = await this.saveReferenceImage(character);
+
+            if (this.isRecordId(character.formId)) {
+                await this.updateOrCreateRecord<CharacterFormRecord>(
+                    Collections.CharacterForms,
+                    character.formId,
+                    this.defaultFormWriteData(
+                        character.id,
+                        character,
+                        referenceImageId,
+                    ),
+                );
+            } else {
+                const formId = this.createRecordId();
+                character.formId = formId;
+                await this.createOrUpdateRecord<CharacterFormRecord>(
+                    Collections.CharacterForms,
+                    formId,
+                    this.defaultFormWriteData(
+                        character.id,
+                        character,
+                        referenceImageId,
+                    ),
+                );
+            }
+
+            character.referenceImageIds = [referenceImageId];
+
+            return character;
+        });
+    }
+
+    async deleteCharacter(character: Character) {
+        return await this.runExclusiveCharacterWrite(character, async () => {
+            if (!this.isRecordId(character.id)) throw new Error("character has no id");
+
+            const characterId = character.id;
+            const characterForms = await this.loadOptionalRecords<CharacterFormRecord>(
+                Collections.CharacterForms,
+                {
+                    filter: this.pb.filter(
+                        "character_id = {:characterId}",
+                        {characterId},
+                    ),
+                },
+            );
+            const characterFormIds = new Set(
+                characterForms
+                    .map(form => form.id)
+                    .filter(this.isRecordId),
+            );
+            const referenceImageIds = new Set(
+                character.referenceImageIds.filter(this.isRecordId),
+            );
+            const legacyBaselines = await this.loadOptionalRecords<LegacyBaselineRecord>(
+                LEGACY_BASELINES_COLLECTION,
+            );
+
+            if (this.isRecordId(character.formId)) {
+                characterFormIds.add(character.formId);
+            }
+
+            for (const form of characterForms) {
+                for (const referenceImageId of form.reference_image_ids ?? []) {
+                    if (this.isRecordId(referenceImageId)) {
+                        referenceImageIds.add(referenceImageId);
+                    }
+                }
+            }
+
+            const legacyBaselineIds = legacyBaselines
+                .filter(baseline => (
+                    baseline.character_id === characterId
+                    || (
+                        this.isRecordId(baseline.character_form_id)
+                        && characterFormIds.has(baseline.character_form_id)
+                    )
+                ))
+                .map(baseline => baseline.id)
+                .filter(this.isRecordId);
+
+            await Promise.all(legacyBaselineIds.map(id => this.deleteRecordIfExists(
+                LEGACY_BASELINES_COLLECTION,
+                id,
+            )));
+            await Promise.all([...characterFormIds].map(id => this.deleteRecordIfExists(
+                Collections.CharacterForms,
+                id,
+            )));
+            await Promise.all([...referenceImageIds].map(id => this.deleteRecordIfExists(
+                Collections.ReferenceImages,
+                id,
+            )));
+            await this.deleteRecordIfExists(
+                Collections.Characters,
+                characterId,
+            );
+
+            character.id = null;
+            character.formId = null;
+            character.referenceImageIds = [];
+            character.uploaded = false;
+        });
+    }
+
+    promptDiscordLogin() {
+        if (this.discordLoginPromise !== null) return this.discordLoginPromise;
+
+        this.discordLoginError = null;
+        this.discordLoginPending = true;
+        const loginPromise = this.performDiscordLogin();
+        this.discordLoginPromise = loginPromise;
+        void loginPromise
+            .catch(error => {
+                this.discordLoginError = this.discordLoginErrorText(error);
+            })
+            .finally(() => {
+                this.discordLoginPromise = null;
+                this.discordLoginPending = false;
+            });
+
+        return loginPromise;
+    }
+
+    private async performDiscordLogin() {
+        const authResult = await this.pb.collection(Collections.Accounts).authWithOAuth2({
+            provider: "discord",
+            scopes: ["identify"],
+            // Repeated realtime callbacks otherwise cancel the first OAuth exchange.
+            // Each UI login remains single-flight through discordLoginPromise.
+            requestKey: null,
+            // PocketBase forwards this only to the final code exchange. Limit the
+            // server request without limiting the user's time in Discord.
+            fetch: this.fetchDiscordOAuthExchange,
+        });
+
+        this.userRecord = authResult.record;
+
+        // PocketBase does not map Discord avatars into the file field by itself.
+        const avatarUrl = authResult.meta!.avatarUrl;
+        fetch(avatarUrl)
+            .then(async response => {
+                await this.pb.collection(Collections.Accounts).update(
+                    authResult.record.id,
+                    {
+                        avatar: new File(
+                            [await response.blob()],
+                            new URL(avatarUrl).pathname.split("/").at(-1) ?? "avatar",
+                        ),
+                    },
+                    POCKETBASE_WRITE_OPTIONS,
+                );
+
+                this.userRecord = await this.pb.collection(Collections.Accounts).getOne(authResult.record.id);
+            })
+            .catch(error => console.error(error));
+
+        await this.getDefaultIdentityForCurrentAccount();
+
+        return authResult;
+    }
+
+    private readonly fetchDiscordOAuthExchange: typeof fetch = async (
+        input,
+        init,
+    ) => {
+        const abortController = new AbortController();
+        let timedOut = false;
+        const abortFromRequest = () => abortController.abort(init?.signal?.reason);
+        const timeoutId = setTimeout(
+            () => {
+                timedOut = true;
+                abortController.abort();
+            },
+            DISCORD_LOGIN_EXCHANGE_TIMEOUT_MS,
+        );
+
+        if (init?.signal?.aborted) {
+            abortFromRequest();
+        } else {
+            init?.signal?.addEventListener("abort", abortFromRequest, {once: true});
+        }
+
+        try {
+            return await fetch(
+                input,
+                {
+                    ...init,
+                    signal: abortController.signal,
+                },
+            );
+        } catch (error) {
+            if (timedOut) throw new DiscordLoginTimeoutError();
+
+            throw error;
+        } finally {
+            clearTimeout(timeoutId);
+            init?.signal?.removeEventListener("abort", abortFromRequest);
+        }
+    };
+
+    private discordLoginErrorText(error: unknown) {
+        if (
+            error instanceof DiscordLoginTimeoutError
+            || (
+                error instanceof ClientResponseError
+                && error.originalError instanceof DiscordLoginTimeoutError
+            )
+        ) return DISCORD_LOGIN_TIMEOUT_MESSAGE;
+
+        return "Discord sign-in failed. Try again.";
+    }
+
+    logout() {
+        this.pb.authStore.clear();
+
+        this.userRecord = null;
+    }
+
+    async createOwnerIdentityObject() {
+        return await this.getDefaultIdentityForCurrentAccount();
+    }
+
+    currentAccountName() {
+        return this.currentAccountRecord()?.username ?? "Account";
+    }
+
+    currentAccountAvatarUrl() {
+        const account = this.currentAccountRecord();
+
+        return this.accountAvatarUrl(account);
+    }
+
+    private currentAccountRecord() {
+        return this.userRecord as AccountRecord | null;
+    }
+
+    private async loadOptionalRecords<RecordType>(
+        collection: string,
+        options: {
+            filter?: string,
+            sort?: string,
+        } = {},
+    ) {
+        try {
+            return await this.pb.collection(collection).getFullList<RecordType>(options);
+        } catch (error) {
+            if (this.isMissingCollectionError(error)) return [];
+
+            throw error;
+        }
+    }
+
+    private isMissingCollectionError(error: unknown) {
+        return this.isPocketBaseStatusError(
+            error,
+            404,
+        );
+    }
+
+    private isMissingRecordError(error: unknown) {
+        return this.isPocketBaseStatusError(
+            error,
+            404,
+        );
+    }
+
+    private isDuplicateRecordIdError(error: unknown) {
+        if (!this.isPocketBaseStatusError(
+            error,
+            400,
+        )) {
+            return false;
+        }
+
+        const idError = this.pocketBaseFieldError(
+            error,
+            "id",
+        );
+        const code = this.errorText(idError?.code);
+        const message = this.errorText(idError?.message);
+
+        return code.includes("unique")
+            || message.includes("unique");
+    }
+
+    private isPocketBaseStatusError(
+        error: unknown,
+        status: number,
+    ) {
+        return typeof error === "object"
+            && error !== null
+            && "status" in error
+            && (error as {status?: number}).status === status;
+    }
+
+    private pocketBaseFieldError(
+        error: unknown,
+        fieldName: string,
+    ) {
+        if (typeof error !== "object" || error === null) return null;
+
+        const response = (error as {
+            response?: {
+                data?: Record<string, {
+                    code?: unknown,
+                    message?: unknown,
+                }>,
+            },
+        }).response;
+
+        return response?.data?.[fieldName] ?? null;
+    }
+
+    private errorText(value: unknown) {
+        return typeof value === "string"
+            ? value.toLowerCase()
+            : "";
+    }
+
+    private syncClientAuthCookie() {
+        if (typeof document === "undefined") return;
+
+        this.pb.authStore.onChange(() => this.writeClientAuthCookie());
+
+        if (this.pb.authStore.token !== "") {
+            this.writeClientAuthCookie();
+        }
+    }
+
+    private writeClientAuthCookie() {
+        document.cookie = this.pb.authStore.exportToCookie({
+            httpOnly: false,
+            sameSite: "lax",
+            secure: window.location.protocol === "https:",
+        });
+    }
+
+    private loadClientAuthCookieFallback() {
+        if (
+            typeof document === "undefined"
+            || this.pb.authStore.record !== null
+            || !document.cookie.includes("pb_auth=")
+        ) {
+            return;
+        }
+
+        this.pb.authStore.loadFromCookie(document.cookie);
+    }
+
+    private collectAccountIds(
+        characters: CharacterRecord[],
+        identities: IdentityRecord[],
+    ) {
+        const accountIds = new Set<string>();
+
+        for (const character of characters) {
+            if (this.isRecordId(character.owner_id)) accountIds.add(character.owner_id);
+        }
+
+        for (const identity of identities) {
+            for (const accountId of identity.account_ids ?? []) {
+                if (this.isRecordId(accountId)) accountIds.add(accountId);
+            }
+        }
+
+        return accountIds;
+    }
+
+    private async loadAccountsById(accountIds: Set<string>) {
+        const accountEntries = await Promise.all([...accountIds].map(async accountId => {
+            try {
+                const account = await this.pb.collection(Collections.Accounts).getOne<AccountRecord>(accountId);
+
+                return [accountId, account] as const;
+            } catch (error) {
+                console.error(error);
+
+                return null;
+            }
+        }));
+
+        return new Map(accountEntries.filter(entry => entry !== null));
+    }
+
+    private groupByCharacterId<RecordType extends {character_id: string}>(
+        records: RecordType[],
+    ) {
+        const recordsByCharacterId = new Map<string, RecordType[]>();
+
+        for (const record of records) {
+            const recordsForCharacter = recordsByCharacterId.get(record.character_id) ?? [];
+            recordsForCharacter.push(record);
+            recordsByCharacterId.set(record.character_id, recordsForCharacter);
+        }
+
+        return recordsByCharacterId;
+    }
+
+    private selectDefaultForm(forms: CharacterFormRecord[]) {
+        return forms.find(form => form.is_default)
+            ?? forms[0]
+            ?? null;
+    }
+
+    private selectLegacyBaseline(
+        baselines: LegacyBaselineRecord[],
+        characterId: string,
+        formId: string | null,
+    ) {
+        if (formId !== null) {
+            const formBaseline = baselines.find(baseline => (
+                baseline.character_form_id === formId
+                && baseline.is_default
+            )) ?? baselines.find(baseline => baseline.character_form_id === formId);
+
+            if (formBaseline !== undefined) return formBaseline;
+        }
+
+        const characterBaselines = baselines.filter(baseline => baseline.character_id === characterId);
+
+        return characterBaselines.find(baseline => (
+            baseline.is_default
+            && baseline.character_form_id === undefined
+        )) ?? characterBaselines.find(baseline => baseline.is_default)
+            ?? characterBaselines[0]
+            ?? null;
+    }
+
+    private selectReferenceImage(
+        form: CharacterFormRecord | null,
+        referenceImagesById: Map<string, ReferenceImageRecord>,
+    ) {
+        for (const referenceImageId of form?.reference_image_ids ?? []) {
+            const referenceImage = referenceImagesById.get(referenceImageId);
+
+            if (referenceImage !== undefined) return referenceImage;
+        }
+
+        return null;
+    }
+
+    private resolveCharacterIdentities(
+        identityIds: string[],
+        identitiesById: Map<string, IdentityRecord>,
+        accountsById: Map<string, AccountRecord>,
+    ) {
+        return identityIds
+            .map(identityId => identitiesById.get(identityId) ?? null)
+            .filter(identity => identity !== null)
+            .map(identity => this.identitySummary(identity, accountsById));
+    }
+
+    private identitySummary(
+        identity: IdentityRecord,
+        accountsById: Map<string, AccountRecord>,
+    ): IdentitySummary {
+        const accountIds = (identity.account_ids ?? []).filter(this.isRecordId);
+        const fallbackAccount = accountIds
+            .map(accountId => accountsById.get(accountId) ?? null)
+            .find(account => account !== null) ?? null;
+
+        return {
+            id: identity.id,
+            identityId: identity.id,
+            accountId: fallbackAccount?.id ?? accountIds[0] ?? null,
+            name: identity.display_name,
+            avatarUrl: identity.avatar === undefined || identity.avatar === ""
+                ? this.accountAvatarUrl(fallbackAccount)
+                : getPocketbaseFileUrl({
+                    collection: Collections.Identities,
+                    recordId: identity.id,
+                    filename: identity.avatar,
+                }),
+        };
+    }
+
+    private legacyIdentitySummary(account: AccountRecord): IdentitySummary {
+        return {
+            id: `legacy-account:${account.id}`,
+            identityId: null,
+            accountId: account.id,
+            name: account.username,
+            avatarUrl: this.accountAvatarUrl(account),
+        };
+    }
+
+    private accountAvatarUrl(account: AccountRecord | null) {
+        if (account === null || account.avatar === undefined || account.avatar === "") return null;
+
+        return getPocketbaseFileUrl({
+            collection: Collections.Accounts,
+            recordId: account.id,
+            filename: account.avatar,
+        });
+    }
+
+    private isRecordId = (recordId: string | null | undefined): recordId is string => {
+        return recordId !== null
+            && recordId !== undefined
+            && recordId !== "";
+    };
+
+    private getLegacyImageSource(characterData: CharacterRecord) {
+        if (characterData.image === undefined || characterData.image === "") return null;
+
+        return {
+            collection: Collections.Characters,
+            recordId: characterData.id,
+            filename: characterData.image,
+        };
+    }
+
+    private referenceImageDimensions(referenceImage: ReferenceImageRecord | null): Dimensions | null {
+        const width = referenceImage?.width_px ?? null;
+        const height = referenceImage?.height_px ?? null;
+
+        if (width === null || height === null || width <= 0 || height <= 0) {
+            return null;
+        }
+
+        return {
+            width,
+            height,
+        };
+    }
+
+    private async resolveOwnerIdentityIds(character: Character) {
+        const ownerIdentityIds = character.ownerIdentities
+            .map(identity => identity.identityId)
+            .filter(this.isRecordId);
+        const legacyCurrentAccountIndex = character.ownerIdentities.findIndex(identity => (
+            identity.identityId === null
+            && identity.accountId === this.userRecord?.id
+        ));
+
+        if (legacyCurrentAccountIndex >= 0) {
+            const currentIdentity = await this.getDefaultIdentityForCurrentAccount();
+            character.ownerIdentities[legacyCurrentAccountIndex] = currentIdentity;
+            ownerIdentityIds.push(currentIdentity.identityId!);
+        }
+
+        if (ownerIdentityIds.length === 0) throw new Error("character has no owner identity");
+
+        return [...new Set(ownerIdentityIds)];
+    }
+
+    private characterWriteData(
+        character: Character,
+        ownerIdentityIds: string[],
+    ): PocketBaseWritePayload {
+        return {
+            name: character.name,
+            owner_identity_ids: ownerIdentityIds,
+            sona_identity_ids: character.sonaIdentities.map(identity => identity.id),
+        };
+    }
+
+    private defaultFormWriteData(
+        characterId: string,
+        character: Character,
+        referenceImageId: string,
+    ): PocketBaseWritePayload {
+        return {
+            character_id: characterId,
+            name: "Default",
+            is_default: true,
+            length_meters: character.baseline.targetLength,
+            length_unit: character.baseline.measurementUnit,
+            reference_image_ids: [referenceImageId],
+        };
+    }
+
+    private async saveReferenceImage(character: Character) {
+        if (character.image === null) throw new Error("character has no image");
+
+        const existingReferenceImageId = character.referenceImageIds[0];
+        const referenceImageData = {
+            anchor_point: character.anchor,
+            shoulder_y: character.validShoulderY,
+            baseline_points: character.baseline.points,
+            baseline_descriptor: character.baseline.descriptor,
+            flipped_horizontally: character.image.flippedHorizontally,
+            width_px: character.image.dimensions.width,
+            height_px: character.image.dimensions.height,
+            reference_sizing_method: character.baseline.referenceSizingMethod,
+            pixel_measurement_px: character.baseline.pixelMeasurementPx,
+            measurements: character.measurements.map(measurement => ({
+                id: measurement.id,
+                points: measurement.points,
+                descriptor: measurement.descriptor,
+                reference_sizing_method: measurement.referenceSizingMethod,
+                pixel_measurement_px: measurement.pixelMeasurementPx,
+            })),
+            reference_measurement_id: character.referenceMeasurementId,
+            shoulder_measurement_id: character.shoulderMeasurementId,
+        };
+        const referenceImageCreateData = {
+            ...referenceImageData,
+            image: character.image.file,
+        };
+
+        if (this.isRecordId(existingReferenceImageId)) {
+            if (character.image.hasObjectUrl) {
+                await this.updateOrCreateRecord<ReferenceImageRecord>(
+                    Collections.ReferenceImages,
+                    existingReferenceImageId,
+                    referenceImageCreateData,
+                );
+            } else {
+                await this.updateOrCreateRecord<ReferenceImageRecord>(
+                    Collections.ReferenceImages,
+                    existingReferenceImageId,
+                    referenceImageData,
+                    referenceImageCreateData,
+                );
+            }
+
+            return existingReferenceImageId;
+        }
+
+        // Allocate ids before network writes so a retry targets the same records.
+        const referenceImageId = this.createRecordId();
+        character.referenceImageIds = [referenceImageId];
+        await this.createOrUpdateRecord<ReferenceImageRecord>(
+            Collections.ReferenceImages,
+            referenceImageId,
+            referenceImageCreateData,
+        );
+
+        return referenceImageId;
+    }
+
+    private async getDefaultIdentityForCurrentAccount() {
+        if (this.userRecord === null) throw new Error("not authenticated");
+
+        const accountId = this.userRecord.id;
+
+        return await this.runDefaultIdentityWrite(accountId, async () => {
+            const account = await this.pb.collection(Collections.Accounts).getOne<AccountRecord>(accountId);
+            const identities = await this.pb.collection(Collections.Identities).getFullList<IdentityRecord>({
+                filter: this.pb.filter(
+                    "account_ids.id = {:accountId}",
+                    {accountId},
+                ),
+                sort: "created",
+            });
+            const accountsById = new Map([[account.id, account]]);
+
+            if (identities.length > 0) {
+                return this.identitySummary(
+                    identities[0],
+                    accountsById,
+                );
+            }
+
+            const identity = await this.createOrUpdateRecord<IdentityRecord>(
+                Collections.Identities,
+                account.id,
+                {
+                    display_name: account.username,
+                    account_ids: [account.id],
+                },
+            );
+
+            return this.identitySummary(
+                identity,
+                accountsById,
+            );
+        });
+    }
+
+    private runExclusiveCharacterWrite<Result>(
+        character: Character,
+        write: () => Promise<Result>,
+    ) {
+        const existingWrite = this.characterWrites.get(character);
+        if (existingWrite !== undefined) return existingWrite as Promise<Result>;
+
+        const writePromise = write().finally(() => {
+            if (this.characterWrites.get(character) === writePromise) {
+                this.characterWrites.delete(character);
+            }
+        });
+        this.characterWrites.set(
+            character,
+            writePromise,
+        );
+
+        return writePromise;
+    }
+
+    private runDefaultIdentityWrite(
+        accountId: string,
+        write: () => Promise<IdentitySummary>,
+    ) {
+        const existingWrite = this.defaultIdentityWrites.get(accountId);
+        if (existingWrite !== undefined) return existingWrite;
+
+        const writePromise = write().finally(() => {
+            if (this.defaultIdentityWrites.get(accountId) === writePromise) {
+                this.defaultIdentityWrites.delete(accountId);
+            }
+        });
+        this.defaultIdentityWrites.set(
+            accountId,
+            writePromise,
+        );
+
+        return writePromise;
+    }
+
+    private async createOrUpdateRecord<RecordType extends PocketbaseCommonRecord>(
+        collection: Collections,
+        id: string,
+        createData: PocketBaseWritePayload,
+        updateData: PocketBaseWritePayload = createData,
+    ) {
+        try {
+            return await this.pb.collection(collection).create<RecordType>({
+                id,
+                ...createData,
+            }, POCKETBASE_WRITE_OPTIONS);
+        } catch (error) {
+            if (!this.isDuplicateRecordIdError(error)) throw error;
+
+            return await this.pb.collection(collection).update<RecordType>(
+                id,
+                updateData,
+                POCKETBASE_WRITE_OPTIONS,
+            );
+        }
+    }
+
+    private async updateOrCreateRecord<RecordType extends PocketbaseCommonRecord>(
+        collection: Collections,
+        id: string,
+        updateData: PocketBaseWritePayload,
+        createData: PocketBaseWritePayload = updateData,
+    ) {
+        try {
+            return await this.pb.collection(collection).update<RecordType>(
+                id,
+                updateData,
+                POCKETBASE_WRITE_OPTIONS,
+            );
+        } catch (error) {
+            if (!this.isMissingRecordError(error)) throw error;
+
+            try {
+                await this.pb.collection(collection).getOne(
+                    id,
+                    POCKETBASE_WRITE_OPTIONS,
+                );
+            } catch (lookupError) {
+                if (!this.isMissingRecordError(lookupError)) throw lookupError;
+
+                return await this.createOrUpdateRecord<RecordType>(
+                    collection,
+                    id,
+                    createData,
+                    updateData,
+                );
+            }
+
+            // PocketBase masks update-rule rejection as 404 even when public reads find the record.
+            throw error;
+        }
+    }
+
+    private async deleteRecordIfExists(
+        collection: string,
+        id: string,
+    ) {
+        try {
+            await this.pb.collection(collection).delete(
+                id,
+                POCKETBASE_WRITE_OPTIONS,
+            );
+        } catch (error) {
+            if (
+                this.isMissingCollectionError(error)
+                || this.isMissingRecordError(error)
+            ) {
+                return;
+            }
+
+            throw error;
+        }
+    }
+
+    private ensureRecordId(recordId: string | null | undefined) {
+        return this.isRecordId(recordId)
+            ? recordId
+            : this.createRecordId();
+    }
+
+    private createRecordId() {
+        const randomValues = new Uint8Array(RECORD_ID_LENGTH);
+        globalThis.crypto.getRandomValues(randomValues);
+
+        return [...randomValues]
+            .map(value => RECORD_ID_ALPHABET[value % RECORD_ID_ALPHABET.length])
+            .join("");
+    }
+}
